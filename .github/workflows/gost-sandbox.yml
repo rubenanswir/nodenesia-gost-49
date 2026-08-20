@@ -1,0 +1,40 @@
+name: Nodenesia GOST sandbox
+on:
+  workflow_dispatch:
+    inputs:
+      task_id: { required: true, type: string }
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  run-gost:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - shell: bash
+        env:
+          TASK_ID: ${{ inputs.task_id }}
+          CONTROL_PLANE_URL: ${{ vars.NODENESIA_CONTROL_PLANE_URL }}
+          OIDC_AUDIENCE: nodenesia-gost-control-plane
+        run: |
+          set -euo pipefail
+          response="$(curl --fail --silent --show-error -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUDIENCE}")"
+          oidc_token="$(jq -er '.value' <<<"$response")"
+          curl --fail --silent --show-error --retry 3 --retry-all-errors -H "Authorization: Bearer $oidc_token" -H 'Content-Type: application/json' --data "{\"runId\":${GITHUB_RUN_ID}}" "${CONTROL_PLANE_URL}/tasks/${TASK_ID}/config" > "$RUNNER_TEMP/nodenesia-gost.json"
+          config="$RUNNER_TEMP/nodenesia-gost.json"
+          get() { jq -er "$1" "$config"; }
+          enc() { python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$1"; }
+          version="$(get '.gost.version')"; local_port="$(get '.gost.localPort')"; bind_port="$(get '.gost.bindPort')"
+          master_host="$(get '.gost.masterHost')"; rendezvous_port="$(get '.gost.rendezvousPort')"; transport="$(get '.gost.tunnelTransport')"
+          ws_path="$(jq -r '.gost.wsPath // "/ws"' "$config")"; tls_server_name="$(jq -r '.gost.tlsServerName // empty' "$config")"
+          socks_user="$(enc "$(get '.gost.socksUsername')")"; socks_pass="$(enc "$(get '.gost.socksPassword')")"
+          tunnel_user="$(enc "$(get '.gost.tunnelUsername')")"; tunnel_pass="$(enc "$(get '.gost.tunnelPassword')")"
+          scheme=socks5; [[ "$transport" == tcp ]] || scheme="socks5+$transport"
+          query=""; [[ "$transport" == tcp ]] || query="?path=$(enc "$ws_path")"
+          [[ "$transport" != wss ]] || query+="&secure=true&serverName=$(enc "${tls_server_name:-$master_host}")"
+          curl -fsSL -o /tmp/gost.tgz "https://github.com/go-gost/gost/releases/download/v$version/gost_${version}_linux_amd64.tar.gz"
+          tar -xzf /tmp/gost.tgz -C /tmp gost; chmod +x /tmp/gost
+          trap 'jobs -pr | xargs -r kill || true; rm -f "$config"' EXIT INT TERM
+          /tmp/gost -L="socks5://$socks_user:$socks_pass@127.0.0.1:$local_port" >/tmp/gost-socks.log 2>&1 &
+          /tmp/gost -L="rtcp://:$bind_port/127.0.0.1:$local_port" -F="$scheme://$tunnel_user:$tunnel_pass@$master_host:$rendezvous_port$query" >/tmp/gost-tunnel.log 2>&1 &
+          sleep 3180
